@@ -1,0 +1,143 @@
+/**
+ * POST /api/webhooks/sarvam?key=<client webhook_secret>
+ * Receives post-call webhooks from the voice engine (deployment / campaign / instant outbound)
+ * and stores them as rows in `calls` for the right client.
+ *
+ * Client resolution: ?key= (preferred, per-client secret) -> app_id match on clients.sarvam_app_id.
+ */
+export const runtime = "nodejs";
+export const maxDuration = 60;
+import { getClientByWebhookSecret, getClientByAppId, upsertCall, payloadToCall, existingCall } from "@/lib/calls";
+import { handoffAfterCall } from "@/lib/handoffAlert";
+import { leadAlertsAfterCall } from "@/lib/leadAlerts";
+import { applyInsight } from "@/lib/callInsight";
+import crypto from "crypto";
+import { sarvamConfig, recordingUrl, SARVAM_VOICES } from "@/lib/sarvamAgent";
+import { optOutPhrase, addDnc } from "@/lib/compliance";
+import { normalisePhone } from "@/lib/campaigns";
+import { sb } from "@/lib/db";
+import { getClientById } from "@/lib/supabase";
+import { reportInstantCall } from "@/lib/instantReport";
+
+/**
+ * Best-effort fetch of the call recording from Sarvam's analytics API.
+ * GET /api/analytics/v1/{org}/{workspace}/{app}/recordings/{interaction_id}
+ * The response shape isn't pinned down in Sarvam's docs, so we try the common key names.
+ * Never throws — a missing or not-yet-processed recording should never break webhook ingestion.
+ */
+async function fetchRecordingUrl(appId: string, interactionId: string): Promise<string | null> {
+  // RANA's own Sarvam workspace first (the RANA Runtime agent), then the older per-client setup.
+  const cfg = sarvamConfig();
+  if (cfg) { const u = await recordingUrl(cfg, appId, interactionId); if (u) return u; }
+  const orgId = process.env.SARVAM_ORG_ID;
+  const workspaceId = process.env.SARVAM_WORKSPACE_ID;
+  const apiKey = process.env.SARVAM_API_KEY;
+  if (!orgId || !workspaceId || !apiKey) return null;
+
+  try {
+    const res = await fetch(
+      `https://apps.sarvam.ai/api/analytics/v1/${orgId}/${workspaceId}/${appId}/recordings/${interactionId}`,
+      { headers: { "X-API-Key": apiKey } }
+    );
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    if (!data || typeof data !== "object") return null;
+    const url =
+      data.recording_url ?? data.url ?? data.audio_url ?? data.recordingUrl ??
+      data.signed_url ?? data.download_url ?? null;
+    return typeof url === "string" && url ? url : null;
+  } catch (err) {
+    console.error("[webhook] recording fetch failed", (err as any)?.message);
+    return null;
+  }
+}
+
+export async function POST(req: Request) {
+  let payload: any;
+  try { payload = await req.json(); } catch { return Response.json({ error: "Invalid JSON" }, { status: 400 }); }
+
+  const key = new URL(req.url).searchParams.get("key");
+  let client = key ? await getClientByWebhookSecret(key) : null;
+  // Fallback for a client's own Sarvam agent (set up before per-client keys). Never for RANA's shared runtime agents,
+  // whose ids are shared by every client — those webhooks must carry ?key=.
+  const shared = new Set([sarvamConfig()?.appId, ...SARVAM_VOICES.map((v) => v.appId)].filter(Boolean) as string[]);
+  if (!client && payload?.app_id && !shared.has(String(payload.app_id))) client = await getClientByAppId(payload.app_id);
+  // A ready-made agent connected to one employee (HQ): its calls (inbound too) belong to that employee and its workspace.
+  let own: any = null;
+  if (payload?.app_id && !shared.has(String(payload.app_id))) {
+    const id = String(payload.app_id).replace(/[^A-Za-z0-9_-]/g, "");
+    [own] = id ? (await sb<any[]>(`/scripts?engine_agent=like.${encodeURIComponent(id + "@")}*&select=id,name,client_id&limit=1`).catch(() => [])) || [] : [];
+    if (own && client && own.client_id !== client.id) own = null;
+    if (!client && own?.client_id) client = await getClientById(own.client_id);
+  }
+  if (own && !payload.rana_script_id) payload.rana_script_id = own.id;
+  if (!client) return Response.json({ error: "Unknown client" }, { status: 404 });
+
+  try {
+    const row = payloadToCall(payload, client.id);
+    // Instant call to a website lead (lib/instantCall): the engine's result carries no phone number, so take the
+    // number and name from our log — HQ then sees who it was, and opt-outs and lead alerts work for these calls too.
+    const instantId = String(payload?.webhook_config?.metadata?.rana_instant_call || "");
+    const instant = /^[0-9a-f-]{36}$/.test(instantId)
+      ? ((await sb<any[]>(`/instant_calls?id=eq.${instantId}&select=phone,name&limit=1`).catch(() => [])) || [])[0] || null
+      : null;
+    if (instant) {
+      if (!row.caller_phone) row.caller_phone = instant.phone;
+      // The engine fills in a placeholder name ("Manan"); the name they typed on the website is the real one.
+      if (instant.name) (row as any).caller_name = instant.name;
+    }
+    if (own) (row as any).agent_variables = { ...((row as any).agent_variables || {}), employee_name: own.name };
+    // No id from Sarvam: derive a stable one, so a retried webhook updates the same row instead of adding another.
+    if (!row.interaction_id) row.interaction_id = `sarvam-${crypto.createHash("sha256").update(JSON.stringify([client.id, payload.user_identifier, payload.start_datetime ?? payload.created_at, payload.user_phone_number, payload.app_id])).digest("hex").slice(0, 32)}`;
+    const prev = await existingCall(row.interaction_id);
+    if (prev && prev.client_id !== client.id) return Response.json({ error: "That call belongs to another workspace." }, { status: 409 });
+    if (prev?.lead_reason === "Set manually by your team.") { delete row.lead_status; delete row.lead_reason; }
+    // Already read by the AI on an earlier delivery: keep its verdict instead of the quick keyword guess.
+    if (prev?.insight) { delete row.lead_status; delete row.lead_reason; delete (row as any).summary; }
+
+    // Recordings only ever exist for calls that actually connected — skip the extra
+    // network round-trip otherwise.
+    const appId = payload?.app_id ?? client.sarvam_app_id;
+    if (appId && row.interaction_id && (row.duration_seconds ?? 0) > 0) {
+      row.recording_url = await fetchRecordingUrl(appId, row.interaction_id);
+    }
+    if (prev?.recording_url && !row.recording_url) delete row.recording_url; // keep a recording we already have
+    if (prev?.handoff) (row as any).follow_up = true; // a handoff stays a follow-up on retried webhooks
+
+    (row as any).engine = "sarvam";
+    let saved: any = await upsertCall(row);
+    // Sarvam serves recordings as audio (not a link), so the call plays through RANA's own route.
+    if (saved?.id && !saved.recording_url && (row.duration_seconds ?? 0) > 0 && /^\d{8}\//.test(String(row.interaction_id))) {
+      saved.recording_url = `/api/calls/${saved.id}/recording`;
+      await sb(`/calls?id=eq.${saved.id}`, { method: "PATCH", prefer: "return=minimal", body: JSON.stringify({ recording_url: saved.recording_url }) }).catch(() => {});
+    }
+    if (instant && saved?.id) await sb(`/instant_calls?id=eq.${instantId}`, { method: "PATCH", prefer: "return=minimal", body: JSON.stringify({ call_id: saved.id }) }).catch(() => {});
+    // AI read of the call: lead / customer / junk / spam / sales pitch, why they called, wholesale, details.
+    if (row.source !== "manual") saved = await applyInsight(client, { ...saved, insight: prev?.insight || saved.insight || null }, { keepLead: prev?.lead_reason === "Set manually by your team." });
+
+    // Website lead: picked up or not, and what they told Priya — saved for HQ → Website leads and emailed once to HQ.
+    if (instant) await reportInstantCall(instantId, saved);
+
+    // "Don't call me again" goes straight onto the do-not-call list so no future campaign dials them.
+    const phone = normalisePhone(String(row.caller_phone || ""));
+    const said = optOutPhrase((row.transcript || []).filter((t: any) => t.role === "user").map((t: any) => t.text).join(" "));
+    if (said && phone) {
+      await addDnc(client.id, [{ phone, source: "caller_request", reason: `Caller said "${said}"`, callId: String(row.interaction_id) }]).catch(() => {});
+    }
+    // Needed a person (ready to pay, asked for someone, existing customer issue…)? Alert them now — once per call.
+    let handoff = prev?.handoff || null;
+    if (!handoff && row.source !== "manual" && (row.duration_seconds ?? 0) > 0) {
+      handoff = await handoffAfterCall(client, saved, payload).catch((e: any) => { console.error("[webhook] handoff", e?.message); return null; });
+    }
+    // The client's own lead alerts (Slack, WhatsApp, email, webhook) — each call to each channel once.
+    const alerts = await leadAlertsAfterCall(client, { ...saved, handoff: handoff || saved.handoff || null, follow_up: saved.follow_up || !!handoff });
+    return Response.json({ ok: true, id: saved.id, lead_status: saved.lead_status, handoff: handoff ? handoff.rule : null, alerts });
+  } catch (err: any) {
+    console.error("[webhook] failed", err?.message);
+    return Response.json({ error: err?.message || "Failed to store call" }, { status: 500 });
+  }
+}
+
+export async function GET() {
+  return Response.json({ ok: true, service: "rana-webhook" });
+}

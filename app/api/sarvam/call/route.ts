@@ -1,0 +1,45 @@
+export const runtime = "nodejs";
+import { getSession } from "@/lib/session";
+import { forbidUnless } from "@/lib/auth";
+import { getScriptById, getClientById } from "@/lib/supabase";
+import { sarvamConfig, sarvamMissing, placeOutboundCall, webhookUrl, withClientNumber, routeVoice, syncAgentVersion } from "@/lib/sarvamAgent";
+import { callingBlock } from "@/lib/plans";
+import { normalisePhone } from "@/lib/campaigns";
+import { dncSet } from "@/lib/compliance";
+import { audit } from "@/lib/audit";
+import { friendly } from "@/lib/sarvamHealth";
+
+/** POST { scriptId, phone, name? } → Sarvam calls this number right now with this employee (a real phone test). */
+export async function POST(req: Request) {
+  const session = await getSession(req);
+  if (!session) return Response.json({ error: "Not authenticated" }, { status: 401 });
+  const denied = forbidUnless(session, "manager"); if (denied) return denied;
+  const base = sarvamConfig();
+  if (!base) return Response.json({ error: "Calling isn't switched on for your account yet — RANA support has been notified." }, { status: 500 });
+  const b = await req.json().catch(() => ({}));
+  const script: any = b.scriptId ? await getScriptById(String(b.scriptId)) : null;
+  if (!script || script.client_id !== session.clientId) return Response.json({ error: "Employee not found" }, { status: 404 });
+  if (!script.published_at) return Response.json({ error: `${script.name} isn't published yet.` }, { status: 400 });
+  const phone = normalisePhone(String(b.phone || ""));
+  if (!phone) return Response.json({ error: "Enter a valid mobile number, e.g. 98765 43210." }, { status: 400 });
+  if ((await dncSet(session.clientId, [phone])).has(phone)) return Response.json({ error: "That number is on your do-not-call list." }, { status: 400 });
+  const client: any = await getClientById(session.clientId);
+  const planBlock = await callingBlock(client);
+  if (planBlock) return Response.json({ error: planBlock, code: "plan_limit" }, { status: 402 });
+  await syncAgentVersion(base, script); // a ready-made agent always calls with its newest version
+  const { cfg } = await routeVoice(withClientNumber(base, client), script.voice_name, script.engine_agent);
+  try {
+    const r = await placeOutboundCall(cfg, {
+      phone, script, caller: { name: String(b.name || "").trim() || null },
+      webhook: client?.webhook_secret ? webhookUrl(client.webhook_secret) : null,
+      metadata: { rana_script_id: script.id, rana_source: "test_call" },
+      // "Test my inbound script": we ring you, and the employee answers as if you had called the business.
+      direction: b.direction === "inbound" ? "inbound" : "outbound",
+    });
+    await audit(session, "number_test_call", { req, targetType: "employee", targetId: script.id, detail: { phone, engine: "sarvam", attemptId: r.attempt_id } }).catch(() => {});
+    return Response.json({ ok: true, attemptId: r.attempt_id, from: cfg.agentNumber });
+  } catch (e: any) {
+    console.error("[call me]", e?.message || e);
+    return Response.json({ error: friendly(e, "Couldn't place the call right now. Please try again in a minute.") }, { status: 502 });
+  }
+}

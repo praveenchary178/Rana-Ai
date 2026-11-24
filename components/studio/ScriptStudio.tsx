@@ -1,0 +1,340 @@
+// @ts-nocheck
+"use client";
+// Script Studio: paste any script → the AI splits it into a call playbook (opening, questions,
+// pitch, objections, FAQs, closing, facts), finds links and hard-to-say words, and points out gaps.
+// Every card stays editable by hand, and "Ask AI to change" edits it in plain words.
+
+import { useState } from "react";
+import { Card, ListEditor, PairEditor, AutoText, Spinner } from "./Editors";
+import AskAiBar from "./AskAiBar";
+import KnowledgePanel from "./KnowledgePanel";
+import PronunciationPanel from "./PronunciationPanel";
+import HandoffPanel from "./HandoffPanel";
+import LanguagePreview from "./LanguagePreview";
+import VoiceScriptInput from "./VoiceScriptInput";
+import { EMPTY_PLAYBOOK, LANG_NAMES, baseLang, detectScriptLanguage, sameScriptLanguage, spokenUrl } from "@/lib/playbook";
+
+const PURPOSES = [["payment", "Payment"], ["website", "Website"], ["booking", "Booking / demo"], ["brochure", "Brochure"], ["other", "Other"]];
+
+const SAMPLE = `Intro: Namaskaram, I'm calling from DBMCI Hyderabad about NEET PG coaching.
+Ask: Which year are you preparing for? Are you doing internship now?
+Pitch: Our NEET PG regular batch starts 5th October. Classes by top faculty, recorded videos, 50+ grand tests.
+Fee is ₹1,20,000. EMI available.
+Objection: Fees are too high → We have EMI from ₹10,000 per month and a 10% early-bird discount till 30th September.
+Objection: I'll think about it → Sure, can I send the brochure on WhatsApp? Seats in the regular batch are limited.
+Close: Ask them to book a free demo class at dbmci.com/demo or pay the seat booking amount at https://rzp.io/l/dbmci-neetpg`;
+
+const SAMPLE_IN = `Greeting: Welcome to The Fashion House, how can I help you today?
+If they ask for the store location: We'll send the location on WhatsApp right after this call. It's opposite City Centre Mall, Banjara Hills.
+Timings: Open 10 am to 10 pm, all 7 days.
+Shirts: Formal and casual shirts from ₹799. Linen shirts ₹1,499. Sizes S to XXL.
+Ethnic wear: Kurtas from ₹1,299, sherwanis from ₹8,999 — best to visit and try.
+Before ending: Is there anything else you are looking for? Do visit us, we're open till 10 pm.
+If we can't answer: Take their name and number — the store team will call back.`;
+
+const EMPTY_SCRIPT = { sourceScript: "", playbook: null, greeting: "" };
+
+export default function ScriptStudio({ value: rawValue, set: rawSet, agentName, openingLanguage, policy, voiceId, voiceName, speed, engine, scriptId, ensureSaved, strictness, setStrictness, strictnessLabels }: any) {
+  // Two scripts: outbound ("we call them": campaigns, call-backs) and inbound ("they call us": the business number).
+  // Links, pronunciation, knowledge and call transfer are shared; the script, greeting and call plan are per direction.
+  const [dir, setDir] = useState<"outbound" | "inbound">(() => (!rawValue.playbook && rawValue.inbound?.playbook ? "inbound" : "outbound"));
+  const inb = { ...EMPTY_SCRIPT, ...(rawValue.inbound || {}) };
+  const value = dir === "inbound" ? { ...rawValue, sourceScript: inb.sourceScript, playbook: inb.playbook, greeting: inb.greeting } : rawValue;
+  const set = (patch: any) => {
+    if (dir === "outbound") return rawSet(patch);
+    const own: any = {}, rest: any = {};
+    for (const [k, v] of Object.entries(patch)) (k in EMPTY_SCRIPT ? own : rest)[k] = v;
+    rawSet({ ...rest, ...(Object.keys(own).length ? { inbound: { ...inb, ...own } } : {}) });
+  };
+  const IN = dir === "inbound";
+  const ready = (x: any) => !!x?.playbook && !!(x.playbook.opening?.trim() || x.playbook.discovery?.some((q: string) => q?.trim()) || x.playbook.pitch?.some((q: string) => q?.trim()) || x.playbook.closing?.trim());
+  const { sourceScript, playbook, greeting, links, pronunciations, keyterms } = value;
+  const [tab, setTab] = useState<"script" | "hear" | "knowledge" | "links" | "say" | "handoff">("script");
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeMsg, setAnalyzeMsg] = useState<{ tone: "ok" | "warn" | "err"; text: string } | null>(null);
+  const [showSource, setShowSource] = useState(!playbook);
+  const [translating, setTranslating] = useState(false);
+  const [translateErr, setTranslateErr] = useState("");
+  const [knowledgeCount, setKnowledgeCount] = useState<number | null>(null);
+  const [inputMode, setInputMode] = useState<"type" | "record" | "upload">("type");
+  const [heard, setHeard] = useState(false);
+
+  const open = baseLang(openingLanguage);
+  const openName = LANG_NAMES[open] || "English";
+  const pb = playbook || EMPTY_PLAYBOOK;
+  const setPb = (patch: any) => set({ playbook: { ...pb, ...patch } });
+
+  async function analyze() {
+    if (playbook && !confirm("Re-reading the script replaces the cards below (knowledge, pronunciation and links you added stay). Continue?")) return;
+    setAnalyzing(true); setAnalyzeMsg(null);
+    try {
+      const res = await fetch("/api/studio/analyze", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ script: sourceScript, agentName, openingLanguage, scriptId, direction: dir }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || "Couldn't read the script.");
+      const mergedLinks = [...links];
+      for (const l of d.links || []) if (!mergedLinks.some((x: any) => x.url === l.url)) mergedLinks.push(l);
+      const mergedPron = [...pronunciations];
+      for (const p of d.pronunciations || []) if (!mergedPron.some((x: any) => x.word.toLowerCase() === p.word.toLowerCase())) mergedPron.push(p);
+      set({
+        playbook: d.playbook,
+        greeting: d.greeting || greeting,
+        links: mergedLinks,
+        pronunciations: mergedPron,
+        keyterms: Array.from(new Set([...(keyterms || []), ...(d.keyterms || [])])),
+      });
+      setShowSource(false);
+      const pbx = d.playbook;
+      const n = (pbx.discovery?.length || 0) + (pbx.pitch?.length || 0) + (pbx.objections?.length || 0) + (pbx.faqs?.length || 0);
+      setAnalyzeMsg(d.fallback
+        ? { tone: "warn", text: d.warning || "AI isn't set up yet, so the script was split by its headings. Check each card." }
+        : d.warning ? { tone: "warn", text: d.warning }
+        : { tone: "ok", text: `Read your script${d.parts > 1 ? ` (in ${d.parts} parts)` : ""}: ${pbx.objections.length} objection${pbx.objections.length === 1 ? "" : "s"}, ${pbx.faqs.length} FAQ${pbx.faqs.length === 1 ? "" : "s"}, ${n} items in total${d.links?.length ? `, ${d.links.length} link${d.links.length === 1 ? "" : "s"}` : ""}. Check the cards below.` });
+    } catch (e: any) { setAnalyzeMsg({ tone: "err", text: e.message }); }
+    finally { setAnalyzing(false); }
+  }
+
+  async function translateGreeting() {
+    setTranslating(true); setTranslateErr("");
+    try {
+      const res = await fetch("/api/studio/translate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: greeting, to: open }) });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || "Translation failed.");
+      set({ greeting: d.text });
+    } catch (e: any) { setTranslateErr(e.message); }
+    finally { setTranslating(false); }
+  }
+
+  // Items picked from a document on the Knowledge tab go into the matching cards (no duplicates).
+  function addFromKnowledge({ facts = [], faqs = [], pitch = [] }: any) {
+    const base = playbook || EMPTY_PLAYBOOK;
+    const k = (t: string) => String(t || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const addUniq = (list: string[], more: string[]) => [...list, ...more.filter((m) => !list.some((x) => k(x) === k(m)))];
+    set({ playbook: { ...base,
+      facts: addUniq(base.facts || [], facts),
+      pitch: addUniq(base.pitch || [], pitch),
+      faqs: [...(base.faqs || []), ...faqs.filter((f: any) => !(base.faqs || []).some((x: any) => k(x.question) === k(f.question)))],
+    } });
+  }
+
+  const greetLang = detectScriptLanguage(greeting);
+  const greetMismatch = greeting.trim() && greetLang && !sameScriptLanguage(greetLang, open);
+
+  const tabs = [
+    ["script", "Script", null],
+    ["hear", open === "en" ? "Hear it" : `Hear in ${openName}`, null],
+    ["knowledge", "Knowledge", knowledgeCount],
+    ["links", "Links & payments", links.length || null],
+    ["say", "Pronunciation", pronunciations.length || null],
+    ["handoff", "Call transfer", value.handoff?.enabled ? value.handoff.contacts?.length || null : null],
+  ];
+
+  const setLink = (i: number, k: string, v: string) => set({ links: links.map((l: any, j: number) => (j === i ? { ...l, [k]: v, ...(k === "url" && (!l.say || l.say === spokenUrl(l.url)) ? { say: spokenUrl(v) } : {}) } : l)) });
+
+  return (
+    <div className="flex flex-col gap-5" data-testid="studio">
+      <div className="flex gap-1 border-b border-line -mx-1">
+        {tabs.map(([k, l, n]) => (
+          <button key={k} type="button" onClick={() => setTab(k as any)} data-testid={`tab-${k}`}
+            className={`px-3 py-2 text-[13px] font-semibold border-b-2 -mb-px flex items-center gap-1.5 ${tab === k ? "border-signal text-signal" : "border-transparent text-ink-soft hover:text-ink"}`}>
+            {l}{n ? <span className="text-[10.5px] bg-paper border border-line rounded-full px-1.5 text-ink-soft">{n}</span> : null}
+          </button>
+        ))}
+      </div>
+
+      {(tab === "script" || tab === "hear") && (
+        <div className="grid grid-cols-2 gap-2" data-testid="direction-switch">
+          {([["outbound", "📤 Outbound script", "We call them — campaigns, follow-ups, call-backs", rawValue], ["inbound", "📥 Inbound script", "They call us — your business number", inb]] as const).map(([k, title, sub, src]) => (
+            <button key={k} type="button" onClick={() => { setDir(k as any); setShowSource(!(src as any).playbook); setAnalyzeMsg(null); }} aria-pressed={dir === k} data-testid={`dir-${k}`}
+              className={`text-left rounded-xl border px-3.5 py-2.5 ${dir === k ? "border-signal ring-1 ring-signal bg-signal-tint/40" : "border-line bg-raised hover:border-signal/50"}`}>
+              <div className="text-[13.5px] font-semibold flex items-center gap-2">{title}
+                <span className={`text-[10.5px] font-mono rounded-full px-1.5 py-0.5 border ${ready(src) ? "text-signal border-signal/50" : "text-ink-soft border-line"}`}>{ready(src) ? "READY" : "NOT SET"}</span>
+              </div>
+              <div className="text-[11.5px] text-ink-soft">{sub}</div>
+            </button>
+          ))}
+          <div className="col-span-2 text-[11.5px] text-ink-soft">
+            {ready(rawValue) && ready(inb) ? "Incoming calls use the inbound script; campaigns and calls we make use the outbound one." : ready(rawValue) || ready(inb) ? `Only the ${ready(inb) ? "inbound" : "outbound"} script is set, so it is used for every call. Add the ${ready(inb) ? "outbound" : "inbound"} one to make ${ready(inb) ? "calls you make" : "incoming calls"} sound right.` : "Fill the inbound script for calls to your number, the outbound one for calls you make — or both."}
+          </div>
+        </div>
+      )}
+
+      {tab === "script" && (
+        <>
+          {/* 1. The raw script */}
+          {showSource ? (
+            <Card title={IN ? "Your inbound script — when customers call you" : "Your outbound script — when you call customers"} hint="Type or paste it, say it out loud, or upload a recording of a good call. Any format — headings, bullet points, a paragraph. English, Telugu, Hindi or mixed." testId="source-card">
+              <div className="flex gap-1.5 mb-3" data-testid="input-modes">
+                {[["type", "⌨ Type script"], ["record", "🎙 Record voice"], ["upload", "⬆ Upload audio"]].map(([k, l]) => (
+                  <button key={k} type="button" onClick={() => setInputMode(k as any)} data-testid={`mode-${k}`}
+                    className={`text-[12.5px] font-semibold px-3 py-1.5 rounded-lg border ${inputMode === k ? "bg-ink text-paper border-ink" : "border-line text-ink-soft hover:text-ink"}`}>{l}</button>
+                ))}
+              </div>
+              {inputMode !== "type" && (
+                <div className="mb-3">
+                  <VoiceScriptInput mode={inputMode} language={policy?.mode === "fixed" ? open : "auto"}
+                    onText={(t: string) => { set({ sourceScript: sourceScript.trim() ? `${sourceScript.trim()}\n\n${t}` : t }); setInputMode("type"); setHeard(true); }} />
+                </div>
+              )}
+              {heard && inputMode === "type" && <div className="text-[12px] text-signal mb-2" data-testid="heard">✓ Written down from your audio. Fix any words it misheard, then build the call plan.</div>}
+              <textarea value={sourceScript} onChange={(e) => set({ sourceScript: e.target.value })} rows={10} data-testid="source-script"
+                placeholder={IN ? "Greeting: Welcome to …, how can I help you today?\nIf they ask for location: …\nTimings: …\nProducts and prices: …\nBefore ending: Is there anything else?" : "Intro: …\nQuestions to ask: …\nOffer / fees: …\nIf they say it's expensive: …\nClosing: …"}
+                className="w-full border border-line rounded-lg px-3 py-2.5 text-[13.5px] bg-raised outline-none focus:border-signal resize-y leading-relaxed" />
+              <div className="flex flex-wrap items-center gap-2 mt-3">
+                <button type="button" onClick={analyze} disabled={analyzing || sourceScript.trim().length < 40} data-testid="analyze"
+                  className="bg-signal text-on-accent rounded-lg px-4 py-2 text-[13px] font-semibold disabled:opacity-40 flex items-center gap-2">
+                  {analyzing ? <><Spinner /> Reading your script…</> : <>✦ {playbook ? "Read it again" : "Build the call plan with AI"}</>}
+                </button>
+                {!playbook && !sourceScript && (
+                  <button type="button" onClick={() => set({ sourceScript: IN ? SAMPLE_IN : SAMPLE })} className="text-[12.5px] font-semibold text-ink-soft underline">Try a sample script</button>
+                )}
+                {!playbook && (
+                  <button type="button" onClick={() => { set({ playbook: { ...EMPTY_PLAYBOOK } }); setShowSource(false); }} className="text-[12.5px] font-semibold text-ink-soft ml-auto">
+                    or write it card by card →
+                  </button>
+                )}
+                {playbook && <button type="button" onClick={() => setShowSource(false)} className="text-[12.5px] font-semibold text-ink-soft ml-auto">Hide</button>}
+              </div>
+              {analyzing && <div className="text-[12px] text-ink-soft mt-2">Finding the opening, questions, objections, FAQs and closing… {sourceScript.length > 9000 ? `this is a long script, so it's read in ${Math.min(6, Math.ceil(sourceScript.length / 9000))} parts at once — about 1–2 minutes.` : "this takes 10–40 seconds."}</div>}
+            </Card>
+          ) : (
+            <button type="button" onClick={() => setShowSource(true)} className="text-left border border-dashed border-line rounded-xl px-4 py-2.5 text-[12.5px] text-ink-soft hover:border-signal">
+              <span className="font-semibold text-ink">Original script</span> · {sourceScript ? `${sourceScript.trim().split(/\s+/).length} words — show / read again` : "paste one to let AI build the plan"}
+            </button>
+          )}
+
+          {analyzeMsg && (
+            <div className={`text-[12.5px] rounded-lg px-3 py-2 border ${analyzeMsg.tone === "ok" ? "bg-signal-tint border-signal/20 text-signal" : analyzeMsg.tone === "warn" ? "bg-hot-tint border-hot/30 text-warm" : "bg-miss-tint border-miss/20 text-miss"}`} data-testid="analyze-msg">
+              {analyzeMsg.text}
+            </div>
+          )}
+
+          {playbook && (
+            <>
+              <AskAiBar playbook={pb} greeting={greeting} links={links} openingLanguage={openingLanguage} onApply={(x: any) => set(x)} />
+
+              {pb.missing?.length > 0 && (
+                <Card title="Gaps the AI noticed" hint="Callers often ask these. Add the answer to a card below, or in Knowledge." tone="warn" testId="missing">
+                  <ul className="flex flex-col gap-1">
+                    {pb.missing.map((m: string, i: number) => (
+                      <li key={i} className="text-[13px] flex items-start gap-2">
+                        <span className="text-hot mt-0.5">!</span><span className="flex-1">{m}</span>
+                        <button type="button" onClick={() => setPb({ missing: pb.missing.filter((_: any, j: number) => j !== i) })} className="text-[11px] text-ink-soft hover:text-ink">Dismiss</button>
+                      </li>
+                    ))}
+                  </ul>
+                </Card>
+              )}
+
+              <Card title={IN ? "Greeting — when you pick up" : "Greeting"} hint={IN ? `Said word-for-word when the employee answers, in ${openName}. Welcome them and ask how you can help.` : `Said word-for-word the moment the call connects, in ${openName}.`} testId="greeting-card"
+                right={greetMismatch ? null : greeting.trim() ? <span className="text-[11px] text-signal font-semibold">✓ {openName}</span> : null}>
+                <AutoText value={greeting} onChange={(v: string) => set({ greeting: v })} rows={2} data-testid="greeting"
+                  placeholder={IN ? (open === "te" ? "నమస్కారం, ఫ్యాషన్ హౌస్‌కి స్వాగతం. ఎలా సహాయం చేయగలను?" : open === "hi" ? "नमस्ते, फ़ैशन हाउस में आपका स्वागत है। मैं आपकी कैसे मदद कर सकती हूँ?" : "Welcome to The Fashion House, how can I help you today?") : open === "te" ? "నమస్కారం, నేను DBMCI నుండి మాట్లాడుతున్నాను…" : open === "hi" ? "नमस्ते, मैं DBMCI से बात कर रही हूँ…" : "Hello, this is Priya calling from DBMCI…"}
+                  className="text-[14px] border border-line rounded-lg px-3 py-2 bg-raised focus:border-signal" />
+                {greetMismatch && (
+                  <div className="mt-2 flex items-center justify-between gap-3 text-[12.5px] bg-hot-tint border border-hot/30 rounded-lg px-3 py-2" data-testid="greeting-mismatch">
+                    <span>This greeting is in {LANG_NAMES[greetLang] || "another language"}, but the employee opens calls in <b>{openName}</b>.</span>
+                    <button type="button" onClick={translateGreeting} disabled={translating} className="shrink-0 bg-raised border border-line rounded-md px-2.5 py-1 font-semibold flex items-center gap-1.5">
+                      {translating ? <Spinner /> : null} Translate to {openName}
+                    </button>
+                  </div>
+                )}
+                {translateErr && <div className="text-[12px] text-miss mt-1">{translateErr}</div>}
+              </Card>
+
+              <div className="grid grid-cols-2 gap-4">
+                <Card title="Goal of the call" hint="What a successful call ends with.">
+                  <AutoText value={pb.goal} onChange={(v: string) => setPb({ goal: v })} placeholder={IN ? "Answer every question and get them to visit the store" : "Book a free demo class or collect the seat booking amount"} className="text-[13.5px]" />
+                </Card>
+                <Card title="Who the employee is" hint="Name, role, tone.">
+                  <AutoText value={pb.persona} onChange={(v: string) => setPb({ persona: v })} placeholder="Priya, a friendly senior counsellor at DBMCI Hyderabad" className="text-[13.5px]" />
+                </Card>
+              </div>
+
+              <Card title={IN ? "① First reply" : "① Opening"} hint={IN ? "After the caller says why they called — how to respond." : "Right after the greeting — why you're calling."} testId="card-opening">
+                <AutoText value={pb.opening} onChange={(v: string) => setPb({ opening: v })} placeholder={IN ? "Sure, I can help with that." : "I'm calling about our NEET PG batch starting next month…"} className="text-[13.5px]" />
+              </Card>
+              <Card title={IN ? "② Details to find out" : "② Questions to ask"} hint={IN ? "Asked only when useful, one at a time." : "Asked one at a time, in this order."} badge={pb.discovery.length} testId="card-discovery">
+                <ListEditor items={pb.discovery} onChange={(v: any) => setPb({ discovery: v })} numbered placeholder={IN ? "What are you looking for — shirts, trousers or ethnic wear?" : "Which year are you preparing for?"} addLabel={IN ? "+ Add a detail" : "+ Add a question"} />
+              </Card>
+              <Card title={IN ? "③ Products, prices & offers" : "③ Pitch"} hint={IN ? "Shared when the caller asks — never pushed." : "Key points, most important first. The employee picks the ones that match the caller."} badge={pb.pitch.length} testId="card-pitch">
+                <ListEditor items={pb.pitch} onChange={(v: any) => setPb({ pitch: v })} numbered placeholder={IN ? "Formal shirts from ₹799, sizes S to XXL" : "Recorded videos you can watch anytime"} addLabel={IN ? "+ Add a product or offer" : "+ Add a point"} />
+              </Card>
+              <Card title={IN ? "④ Common requests" : "④ Objection handling"} hint={IN ? "What callers ask for, and what the employee does." : "When the caller pushes back."} badge={pb.objections.length} testId="card-objections">
+                <PairEditor items={pb.objections} onChange={(v: any) => setPb({ objections: v })} left={IN ? "If the caller asks" : "If the caller says"} right={IN ? "Do / say" : "Respond with"} leftKey="objection" rightKey="response"
+                  leftPh={IN ? "Store location" : "Fees are too high"} rightPh={IN ? "We'll send the location on WhatsApp right after this call." : "We have EMI from ₹10,000 a month…"} addLabel={IN ? "+ Add a request" : "+ Add an objection"} />
+              </Card>
+              <Card title={IN ? "⑤ Before ending" : "⑤ Closing"} hint={IN ? "Always asks if there's anything else before goodbye." : "The exact ask / next step."} testId="card-closing">
+                <AutoText value={pb.closing} onChange={(v: string) => setPb({ closing: v })} placeholder={IN ? "Is there anything else you are looking for? Do visit us — we're open till 10 pm." : "Shall I book your free demo class for this Saturday?"} className="text-[13.5px]" />
+              </Card>
+              <Card title={IN ? "If we can't help" : "If they're not ready"} hint={IN ? "Take a message — the team calls back." : "Callback, send details on WhatsApp, etc."}>
+                <AutoText value={pb.followUp} onChange={(v: string) => setPb({ followUp: v })} placeholder={IN ? "Take their name and number; the store team will call back today." : "Offer to send the brochure on WhatsApp and ask for a good time to call back."} className="text-[13.5px]" />
+              </Card>
+              <Card title="Questions callers ask" hint="The employee answers these from here — word it the way you'd say it." badge={pb.faqs.length} testId="card-faqs">
+                <PairEditor items={pb.faqs} onChange={(v: any) => setPb({ faqs: v })} left="Question" right="Answer" leftKey="question" rightKey="answer"
+                  leftPh="Is there hostel facility?" rightPh="Hostel isn't included, but we can share nearby options." addLabel="+ Add a question" />
+              </Card>
+              <div className="grid grid-cols-2 gap-4">
+                <Card title="Facts" hint="Prices, dates, timings — never changed." badge={pb.facts.length || null} testId="card-facts">
+                  <ListEditor items={pb.facts} onChange={(v: any) => setPb({ facts: v })} placeholder="Regular batch starts 5 October" addLabel="+ Add a fact" />
+                </Card>
+                <Card title="Never say" hint="Promises it must not make." badge={pb.doNot.length || null}>
+                  <ListEditor items={pb.doNot} onChange={(v: any) => setPb({ doNot: v })} placeholder="Never guarantee a rank or selection" addLabel="+ Add a rule" />
+                </Card>
+              </div>
+
+              <div className="flex items-center gap-3 text-[12.5px]">
+                <span className="text-ink-soft">How closely should it stick to this?</span>
+                <select value={strictness} onChange={(e) => setStrictness(parseInt(e.target.value, 10))} className="border border-line rounded-lg px-2 py-1 text-[12.5px] bg-raised outline-none">
+                  {strictnessLabels.map((t: any) => <option key={t.value} value={t.value}>{t.label}</option>)}
+                </select>
+                <span className="text-ink-soft">{strictnessLabels.find((t: any) => t.value === strictness)?.description}</span>
+              </div>
+            </>
+          )}
+        </>
+      )}
+
+      {tab === "hear" && <LanguagePreview value={value} set={set} language={open} voiceId={voiceId} voiceName={voiceName} speed={speed} engine={engine} />}
+      {tab === "handoff" && <HandoffPanel value={value.handoff} onChange={(v: any) => set({ handoff: v })} />}
+      {tab === "knowledge" && <KnowledgePanel scriptId={scriptId} ensureSaved={ensureSaved} onCount={setKnowledgeCount} openingLanguage={openingLanguage} onUse={addFromKnowledge} />}
+
+      {tab === "links" && (
+        <div className="flex flex-col gap-3" data-testid="links">
+          <div className="text-[12.5px] text-ink-soft">
+            Payment pages, your website, demo booking. On the call the employee says the short spoken form (never letter by letter) and tells the caller your team will send the link on WhatsApp.
+            {policy?.mode === "match_caller" ? " It says it in the caller's language." : ""}
+          </div>
+          {links.map((l: any, i: number) => (
+            <div key={i} className="border border-line rounded-xl bg-raised p-3 flex flex-col gap-2" data-testid="link-row">
+              <div className="flex gap-2">
+                <input value={l.label} onChange={(e) => setLink(i, "label", e.target.value)} placeholder="Label, e.g. Seat booking"
+                  className="w-[180px] border border-line rounded-lg px-2.5 py-1.5 text-[13px] font-semibold outline-none focus:border-signal" />
+                <select value={l.purpose} onChange={(e) => setLink(i, "purpose", e.target.value)} className="border border-line rounded-lg px-2 text-[12.5px] bg-raised outline-none">
+                  {PURPOSES.map(([k, t]) => <option key={k} value={k}>{t}</option>)}
+                </select>
+                <button type="button" onClick={() => set({ links: links.filter((_: any, j: number) => j !== i) })} className="ml-auto text-miss text-[12px] font-semibold px-1" aria-label="Remove link">✕</button>
+              </div>
+              <input value={l.url} onChange={(e) => setLink(i, "url", e.target.value)} placeholder="https://rzp.io/l/your-link"
+                className="border border-line rounded-lg px-2.5 py-1.5 text-[13px] outline-none focus:border-signal font-mono" />
+              <div className="flex items-center gap-2 text-[12.5px]">
+                <span className="text-ink-soft shrink-0">Says it as</span>
+                <input value={l.say || ""} onChange={(e) => setLink(i, "say", e.target.value)} placeholder={spokenUrl(l.url)}
+                  className="flex-1 border-b border-line py-1 outline-none focus:border-signal bg-transparent" />
+              </div>
+              {l.purpose === "payment" && <div className="text-[11.5px] text-warm">Shared only when the caller is ready to pay or asks how to pay.</div>}
+            </div>
+          ))}
+          <button type="button" onClick={() => set({ links: [...links, { label: "", url: "", purpose: "website", say: "" }] })} className="text-[12.5px] font-semibold text-signal text-left">+ Add a link</button>
+        </div>
+      )}
+
+      {tab === "say" && (
+        <PronunciationPanel items={pronunciations} onChange={(v: any) => set({ pronunciations: v })} keyterms={keyterms || []} onKeytermsChange={(v: any) => set({ keyterms: v })}
+          voiceId={voiceId} voiceName={voiceName} language={open} allowedLanguages={policy?.mode === "fixed" ? [open] : policy?.allowed} speed={speed} engine={engine} />
+      )}
+    </div>
+  );
+}

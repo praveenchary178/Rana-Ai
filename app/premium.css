@@ -1,0 +1,77 @@
+/* ============================================================
+   Dashboard day theme: the default look of every signed-in page.
+   Quiet near-white ground, white panels, hairlines, graphite text and one deep evergreen accent
+   (RANA's aqua, taken down to a tone that reads as ink). No glow, no grid, no gradients.
+   Applies only where the dashboard menu is on the page, so the public site keeps its own look.
+   Night mode (the old dark theme) is still there: the switch in the menu adds .app-night.
+   ============================================================ */
+:root:has([data-testid='sidebar']):not(.app-night) {
+  --c-paper: 248 249 251;
+  --c-sunken: 243 245 248;
+  --c-raised: 255 255 255;
+  --c-ink: 13 17 23;
+  --c-ink-soft: 91 100 114;
+  --c-line: 228 231 236;
+  --c-signal: 12 74 68;
+  --c-signal-tint: 232 241 240;
+  --c-on-accent: 255 255 255;
+  --c-violet: 51 84 200;
+  --c-violet-tint: 233 238 252;
+  --c-hot: 180 83 9;
+  --c-hot-tint: 254 243 226;
+  --c-warm: 133 100 4;
+  --c-warm-tint: 250 243 214;
+  --c-miss: 185 28 28;
+  --c-miss-tint: 253 232 232;
+  --grid: transparent;
+  --glow-a: transparent;
+  --glow-b: transparent;
+  color-scheme: light;
+}
+:root:has([data-testid='sidebar']):not(.app-night) body { background-image: none; }
+
+/* Panels sit on the page with a hairline and the faintest lift, never a glow. */
+:root:has([data-testid='sidebar']):not(.app-night) :where(.bg-raised) { box-shadow: 0 1px 2px rgb(16 24 40 / 0.04); }
+:root:has([data-testid='sidebar']):not(.app-night) .shadow-glow,
+:root:has([data-testid='sidebar']):not(.app-night) .shadow-card { box-shadow: 0 1px 2px rgb(16 24 40 / 0.06); }
+:root:has([data-testid='sidebar']):not(.app-night) .shadow-lg,
+:root:has([data-testid='sidebar']):not(.app-night) .shadow-xl,
+:root:has([data-testid='sidebar']):not(.app-night) .shadow-2xl { box-shadow: 0 12px 32px -12px rgb(16 24 40 / 0.18), 0 2px 6px rgb(16 24 40 / 0.06); }
+:root:has([data-testid='sidebar']):not(.app-night) .glass { background: rgb(255 255 255); }
+
+/* The one accent: solid, calm, and it darkens a touch on hover. */
+:root:has([data-testid='sidebar']):not(.app-night) .bg-signal:not(:disabled):hover { box-shadow: none; filter: brightness(1.18); }
+:root:has([data-testid='sidebar']):not(.app-night) .btn-glow { box-shadow: none; }
+:root:has([data-testid='sidebar']):not(.app-night) .btn-glow:hover { box-shadow: none; transform: none; filter: brightness(1.18); }
+:root:has([data-testid='sidebar']):not(.app-night) .text-gradient { background: none; -webkit-background-clip: border-box; background-clip: border-box; color: rgb(var(--c-ink)); }
+:root:has([data-testid='sidebar']):not(.app-night) .brand-mark { background: rgb(var(--c-signal)); box-shadow: none; }
+:root:has([data-testid='sidebar']):not(.app-night) .live-dot { animation: none; box-shadow: none; }
+
+/* Type: tighter headings, steadier numbers. */
+:root:has([data-testid='sidebar']):not(.app-night) h1 { letter-spacing: -0.022em; }
+:root:has([data-testid='sidebar']):not(.app-night) .font-mono { font-variant-numeric: tabular-nums; }
+:root:has([data-testid='sidebar']):not(.app-night) ::selection { background: rgb(var(--c-signal) / 0.16); }
+
+/* ============================================================
+   One page header and one page padding on every dashboard page, day or night.
+   Older pages wrote their own title size and padding; these rules bring them to the shared layout
+   (26px title, 13.5px subtitle, 28px top, 20px sides on phones and 40px on wide screens).
+   ============================================================ */
+[data-testid='sidebar'] ~ .flex-1.p-10,
+[data-testid='sidebar'] ~ .flex-1.p-6,
+[data-testid='sidebar'] ~ .flex-1.px-6 { padding: 28px 20px 80px; }
+@media (min-width: 768px) {
+  [data-testid='sidebar'] ~ .flex-1.p-10,
+  [data-testid='sidebar'] ~ .flex-1.p-6,
+  [data-testid='sidebar'] ~ .flex-1.px-6 { padding-bottom: 32px; }
+}
+@media (min-width: 1024px) {
+  [data-testid='sidebar'] ~ .flex-1.p-10,
+  [data-testid='sidebar'] ~ .flex-1.p-6,
+  [data-testid='sidebar'] ~ .flex-1.px-6 { padding-left: 40px; padding-right: 40px; }
+}
+[data-testid='sidebar'] ~ .flex-1 [class~='font-display'][class~='font-semibold'][class~='text-[20px]']:nth-child(-n+2),
+[data-testid='sidebar'] ~ .flex-1 [class~='font-display'][class~='font-semibold'][class~='text-[22px]']:nth-child(-n+2) { font-size: 26px; line-height: 1.2; letter-spacing: -0.022em; }
+[data-testid='sidebar'] ~ .flex-1 [class~='font-display'][class~='font-semibold'][class~='text-[20px]']:nth-child(-n+2) + .text-ink-soft,
+[data-testid='sidebar'] ~ .flex-1 [class~='font-display'][class~='font-semibold'][class~='text-[22px]']:nth-child(-n+2) + .text-ink-soft { font-size: 13.5px; margin-top: 4px; }
+[data-testid='sidebar'] ~ .flex-1 h1 { letter-spacing: -0.022em; }
